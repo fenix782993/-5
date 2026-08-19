@@ -36,7 +36,7 @@ logger = logging.getLogger("fenix")
 
 
 # ============================================================
-# FLASK / RENDER WEB SERVICE
+# FLASK / RENDER
 # ============================================================
 
 app = Flask(__name__)
@@ -49,16 +49,10 @@ def index():
 
 @app.get("/health")
 def health():
-    telegram_status = (
-        "running"
-        if _bot_thread is not None and _bot_thread.is_alive()
-        else "starting"
-    )
-
     return {
         "status": "ok",
         "service": "fenix-report",
-        "telegram_bot": telegram_status,
+        "telegram_bot": "running"
     }, 200
 
 
@@ -66,62 +60,40 @@ def health():
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "0").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 except ValueError:
     ADMIN_ID = 0
 
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан в Environment Variables")
-
+    raise RuntimeError("BOT_TOKEN не задан")
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан в Environment Variables")
-
-
-# Render/PostgreSQL sometimes gives postgres://
-# asyncpg prefers postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgres://",
-        "postgresql://",
-        1
-    )
-
-# Remove accidental quotes from Render variable
-DATABASE_URL = DATABASE_URL.strip("\"'")
+    raise RuntimeError("DATABASE_URL не задан")
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-bot = Bot(
-    token=BOT_TOKEN
-)
+# Bot создаём внутри asyncio loop бота.
+# Это безопаснее для запуска в отдельном thread.
+bot: Bot | None = None
 
 dp = Dispatcher(
     storage=MemoryStorage()
 )
 
 
-# PostgreSQL pool
+# ============================================================
+# POSTGRESQL
+# ============================================================
+
 db: asyncpg.Pool | None = None
-
-
-# ============================================================
-# BOT THREAD VARIABLES
-# ============================================================
-
-_bot_thread = None
-_bot_thread_lock = threading.Lock()
 
 
 # ============================================================
@@ -172,7 +144,7 @@ class AdminBroadcast(StatesGroup):
 
 
 # ============================================================
-# DATABASE
+# DATABASE INIT
 # ============================================================
 
 async def init_db():
@@ -184,79 +156,121 @@ async def init_db():
 
     logger.info("Connecting to PostgreSQL...")
 
-    db = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        command_timeout=30,
-    )
+    try:
 
-    async with db.acquire() as conn:
+        db = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+        )
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        async with db.acquire() as conn:
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    telegram_id BIGINT PRIMARY KEY
+                        REFERENCES users(telegram_id)
+                        ON DELETE CASCADE,
+
+                    active BOOLEAN NOT NULL DEFAULT FALSE,
+
+                    expires_at TIMESTAMPTZ,
+
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS complaints (
+                    id BIGSERIAL PRIMARY KEY,
+
+                    telegram_id BIGINT NOT NULL
+                        REFERENCES users(telegram_id)
+                        ON DELETE CASCADE,
+
+                    category TEXT NOT NULL,
+
+                    target TEXT NOT NULL,
+
+                    details TEXT NOT NULL,
+
+                    generated_text TEXT NOT NULL,
+
+                    status TEXT NOT NULL DEFAULT 'SAVED',
+
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_users_last_seen
+                ON users(last_seen)
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_complaints_user
+                ON complaints(telegram_id)
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_complaints_status
+                ON complaints(status)
+            """)
+
+        logger.info("PostgreSQL initialized successfully")
+        logger.info("✅ PostgreSQL connected")
+
+    except Exception:
+
+        logger.exception(
+            "❌ PostgreSQL connection failed"
+        )
+
+        if db is not None:
+
+            try:
+                await db.close()
+            except Exception:
+                pass
+
+            db = None
+
+        raise
+
+
+# ============================================================
+# DATABASE CLOSE
+# ============================================================
+
+async def close_db():
+
+    global db
+
+    if db is not None:
+
+        try:
+            await db.close()
+            logger.info("PostgreSQL pool closed")
+        except Exception as e:
+            logger.warning(
+                "PostgreSQL close error: %s",
+                e
             )
-        """)
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                telegram_id BIGINT PRIMARY KEY
-                    REFERENCES users(telegram_id)
-                    ON DELETE CASCADE,
-
-                active BOOLEAN NOT NULL DEFAULT FALSE,
-
-                expires_at TIMESTAMPTZ,
-
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS complaints (
-                id BIGSERIAL PRIMARY KEY,
-
-                telegram_id BIGINT NOT NULL
-                    REFERENCES users(telegram_id)
-                    ON DELETE CASCADE,
-
-                category TEXT NOT NULL,
-
-                target TEXT NOT NULL,
-
-                details TEXT NOT NULL,
-
-                generated_text TEXT NOT NULL,
-
-                status TEXT NOT NULL DEFAULT 'SAVED',
-
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_users_last_seen
-            ON users(last_seen)
-        """)
-
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_complaints_user
-            ON complaints(telegram_id)
-        """)
-
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_complaints_status
-            ON complaints(status)
-        """)
-
-    logger.info("PostgreSQL initialized successfully")
+        db = None
 
 
 # ============================================================
@@ -268,8 +282,8 @@ async def upsert_user(message: Message):
     if db is None:
         await init_db()
 
-    if message.from_user is None:
-        return
+    if db is None:
+        raise RuntimeError("Database is not initialized")
 
     user = message.from_user
 
@@ -313,6 +327,9 @@ async def ensure_user(user_id: int):
     if db is None:
         await init_db()
 
+    if db is None:
+        raise RuntimeError("Database is not initialized")
+
     await db.execute("""
         INSERT INTO users (
             telegram_id
@@ -342,12 +359,14 @@ async def ensure_user(user_id: int):
 
 async def has_subscription(user_id: int) -> bool:
 
-    # ADMIN always has access
     if user_id == ADMIN_ID:
         return True
 
     if db is None:
         await init_db()
+
+    if db is None:
+        return False
 
     row = await db.fetchrow("""
         SELECT
@@ -367,11 +386,11 @@ async def has_subscription(user_id: int) -> bool:
 
     expires_at = row["expires_at"]
 
-    # Permanent subscription
+    # Бессрочная подписка
     if expires_at is None:
         return True
 
-    # Expired subscription
+    # Истекла
     if expires_at <= datetime.now(timezone.utc):
 
         await db.execute("""
@@ -676,17 +695,27 @@ async def profile(callback: CallbackQuery):
     active = bool(row and row["active"])
 
     if row and row["expires_at"]:
+
         expires = row["expires_at"].strftime(
             "%d.%m.%Y %H:%M"
         )
+
     else:
+
         expires = "∞"
 
-    username = (
-        f"@{escape(callback.from_user.username)}"
-        if callback.from_user.username
-        else "нет"
-    )
+    if callback.from_user.username:
+
+        username = (
+            "@"
+            + escape(
+                callback.from_user.username
+            )
+        )
+
+    else:
+
+        username = "нет"
 
     text = (
         "👤 <b>ПРОФИЛЬ</b>\n\n"
@@ -839,7 +868,9 @@ async def complaint_target(
     state: FSMContext
 ):
 
-    target = (message.text or "").strip()
+    target = (
+        message.text or ""
+    ).strip()
 
     if len(target) < 2:
 
@@ -886,7 +917,9 @@ async def complaint_details(
     state: FSMContext
 ):
 
-    details = (message.text or "").strip()
+    details = (
+        message.text or ""
+    ).strip()
 
     if len(details) < 10:
 
@@ -906,8 +939,20 @@ async def complaint_details(
 
     data = await state.get_data()
 
-    category = data["category"]
-    target = data["target"]
+    category = data.get("category")
+    target = data.get("target")
+
+    if not category or not target:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Сессия обращения потеряна. "
+            "Начните заново.",
+            reply_markup=main_menu()
+        )
+
+        return
 
     generated = generate_complaint(
         category,
@@ -956,6 +1001,9 @@ async def complaint_save(
 
         return
 
+    if db is None:
+        await init_db()
+
     data = await state.get_data()
 
     required = [
@@ -978,9 +1026,6 @@ async def complaint_save(
         )
 
         return
-
-    if db is None:
-        await init_db()
 
     await db.execute("""
         INSERT INTO complaints (
@@ -1107,9 +1152,7 @@ async def my_complaints(
                 row["target"]
             )
 
-            created = row[
-                "created_at"
-            ].strftime(
+            created = row["created_at"].strftime(
                 "%d.%m.%Y %H:%M"
             )
 
@@ -1354,20 +1397,15 @@ async def admin_users(
 
         for row in rows:
 
-            active = row["active"]
-
-            if active and row["expires_at"]:
-                if row["expires_at"] <= datetime.now(timezone.utc):
-                    active = False
-
             status = (
                 "✅"
-                if active
+                if row["active"]
                 else "❌"
             )
 
             username = (
-                "@" + escape(row["username"])
+                "@"
+                + escape(row["username"])
                 if row["username"]
                 else "без username"
             )
@@ -1422,7 +1460,9 @@ async def admin_subscription_user(
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
         return
 
     try:
@@ -1467,7 +1507,9 @@ async def admin_subscription_duration(
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
         return
 
     try:
@@ -1494,7 +1536,18 @@ async def admin_subscription_duration(
 
     data = await state.get_data()
 
-    user_id = data["user_id"]
+    user_id = data.get("user_id")
+
+    if not user_id:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Пользователь не определён.",
+            reply_markup=admin_menu()
+        )
+
+        return
 
     await ensure_user(user_id)
 
@@ -1546,23 +1599,26 @@ async def admin_subscription_duration(
         reply_markup=admin_menu()
     )
 
-    try:
+    # Уведомляем пользователя
+    if bot is not None:
 
-        await bot.send_message(
-            user_id,
-            "🔥 <b>FENIX REPORT</b>\n\n"
-            "✅ Администратор выдал вам доступ.",
-            parse_mode="HTML",
-            reply_markup=main_menu()
-        )
+        try:
 
-    except Exception as e:
+            await bot.send_message(
+                user_id,
+                "🔥 <b>FENIX REPORT</b>\n\n"
+                "✅ Администратор выдал вам доступ.",
+                parse_mode="HTML",
+                reply_markup=main_menu()
+            )
 
-        logger.warning(
-            "Не удалось уведомить %s: %s",
-            user_id,
-            e
-        )
+        except Exception as e:
+
+            logger.warning(
+                "Не удалось уведомить %s: %s",
+                user_id,
+                e
+            )
 
 
 # ============================================================
@@ -1598,7 +1654,9 @@ async def admin_remove_sub_user(
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
         return
 
     try:
@@ -1672,7 +1730,9 @@ async def admin_search_result(
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
         return
 
     try:
@@ -1729,7 +1789,8 @@ async def admin_search_result(
     )
 
     username = (
-        "@" + escape(row["username"])
+        "@"
+        + escape(row["username"])
         if row["username"]
         else "нет"
     )
@@ -1742,15 +1803,9 @@ async def admin_search_result(
         else "∞"
     )
 
-    active = bool(row["active"])
-
-    if active and row["expires_at"]:
-        if row["expires_at"] <= datetime.now(timezone.utc):
-            active = False
-
     status = (
         "✅ Активна"
-        if active
+        if row["active"]
         else "❌ Нет"
     )
 
@@ -1824,9 +1879,7 @@ async def admin_complaints(
                 row["target"]
             )
 
-            created = row[
-                "created_at"
-            ].strftime(
+            created = row["created_at"].strftime(
                 "%d.%m.%Y %H:%M"
             )
 
@@ -1883,10 +1936,14 @@ async def admin_broadcast_send(
     state: FSMContext
 ):
 
-    if not is_admin(message.from_user.id):
+    if not is_admin(
+        message.from_user.id
+    ):
         return
 
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
 
     if not text:
 
@@ -1907,6 +1964,14 @@ async def admin_broadcast_send(
     sent = 0
     failed = 0
 
+    if bot is None:
+
+        await message.answer(
+            "❌ Telegram bot ещё не готов."
+        )
+
+        return
+
     for row in users:
 
         try:
@@ -1918,7 +1983,6 @@ async def admin_broadcast_send(
 
             sent += 1
 
-            # Telegram rate limit protection
             await asyncio.sleep(0.05)
 
         except Exception as e:
@@ -1983,109 +2047,109 @@ async def fallback(
 
 async def bot_runner():
 
+    global bot
     global db
 
     logger.info("====================================")
     logger.info("🔥 FENIX REPORT TELEGRAM STARTING")
     logger.info("====================================")
 
-    try:
+    while True:
 
-        while True:
+        try:
 
-            try:
+            logger.info(
+                "Connecting to PostgreSQL..."
+            )
 
-                logger.info(
-                    "Connecting to PostgreSQL..."
-                )
+            await init_db()
 
-                await init_db()
+            logger.info(
+                "🔥 Creating Telegram Bot..."
+            )
 
-                logger.info(
-                    "✅ PostgreSQL connected"
-                )
+            bot = Bot(
+                token=BOT_TOKEN
+            )
 
-                logger.info(
-                    "🔥 Starting Telegram polling..."
-                )
+            logger.info(
+                "🔥 Starting Telegram polling..."
+            )
 
-                await dp.start_polling(
-                    bot,
-                    allowed_updates=dp.resolve_used_update_types()
-                )
+            # ВАЖНО:
+            #
+            # Render запускает polling
+            # в background thread.
+            #
+            # aiogram по умолчанию пытается
+            # установить OS signal handlers.
+            #
+            # В background thread это вызывает:
+            #
+            # RuntimeError:
+            # set_wakeup_fd only works in main thread
+            #
+            # Поэтому обязательно:
+            #
+            # handle_signals=False
+            #
 
-                # If polling stops normally, wait before restart.
-                logger.warning(
-                    "Telegram polling stopped normally."
-                )
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                handle_signals=False
+            )
 
-            except asyncio.CancelledError:
+            logger.info(
+                "Telegram polling stopped normally"
+            )
 
-                logger.info(
-                    "Telegram bot polling cancelled."
-                )
+        except asyncio.CancelledError:
 
-                raise
+            logger.info(
+                "Telegram bot cancelled"
+            )
 
-            except Exception:
+            break
 
-                logger.exception(
-                    "❌ Telegram bot crashed"
-                )
+        except Exception:
 
-                # Close broken PostgreSQL pool
-                if db is not None:
+            logger.exception(
+                "❌ Telegram bot crashed"
+            )
 
-                    try:
-                        await db.close()
+            await close_db()
 
-                    except Exception:
-                        logger.exception(
-                            "Error while closing PostgreSQL pool"
-                        )
+            if bot is not None:
 
-                    db = None
+                try:
+                    await bot.session.close()
+                except Exception:
+                    pass
 
-                logger.info(
-                    "🔄 Retry Telegram bot in 10 seconds..."
-                )
+                bot = None
 
-                await asyncio.sleep(10)
+            logger.info(
+                "🔄 Retry Telegram bot in 10 seconds..."
+            )
 
-    except asyncio.CancelledError:
+            await asyncio.sleep(10)
 
-        logger.info(
-            "Telegram bot runner cancelled"
-        )
+        finally:
 
-    except Exception:
-
-        logger.exception(
-            "❌ Fatal Telegram bot runner error"
-        )
-
-    finally:
-
-        logger.info(
-            "Telegram bot runner stopped"
-        )
-
-        if db is not None:
-
-            try:
-                await db.close()
-
-            except Exception:
-                logger.exception(
-                    "Error while closing PostgreSQL"
-                )
-
-            db = None
+            logger.info(
+                "Telegram bot runner cycle finished"
+            )
 
 
 # ============================================================
 # START BOT THREAD
 # ============================================================
+
+_bot_thread = None
+
+_bot_thread_lock = threading.Lock()
+
 
 def start_bot_thread():
 
@@ -2106,6 +2170,10 @@ def start_bot_thread():
 
         def runner():
 
+            logger.info(
+                "🔥 Telegram bot background thread STARTED"
+            )
+
             try:
 
                 asyncio.run(
@@ -2115,7 +2183,7 @@ def start_bot_thread():
             except Exception:
 
                 logger.exception(
-                    "Telegram bot thread crashed"
+                    "❌ Telegram bot thread crashed"
                 )
 
         _bot_thread = threading.Thread(
@@ -2132,17 +2200,17 @@ def start_bot_thread():
 
 
 # ============================================================
-# IMPORTANT FOR GUNICORN
+# GUNICORN STARTUP
 # ============================================================
-#
+
 # Render:
 #
 # gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
 #
 # Gunicorn импортирует main.py.
 #
-# Поэтому start_bot_thread() вызывается при импорте.
-# ============================================================
+# Поэтому запускаем Telegram thread
+# после создания Flask app.
 
 start_bot_thread()
 
