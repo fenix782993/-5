@@ -1912,27 +1912,51 @@ async def bot_runner():
 
     global db
 
-    try:
+    logger.info("====================================")
+    logger.info("🔥 FENIX REPORT TELEGRAM STARTING")
+    logger.info("====================================")
 
-        logger.info("====================================")
-        logger.info("🔥 FENIX REPORT TELEGRAM STARTING")
-        logger.info("====================================")
+    while True:
 
-        # PostgreSQL
-        await init_db()
+        try:
 
-        # Проверяем Telegram API
-        me = await bot.get_me()
+            logger.info("Connecting to PostgreSQL...")
 
-        logger.info(
-            "Telegram connected: @%s | ID=%s",
-            me.username,
-            me.id
-        )
+            await init_db()
 
-        logger.info(
-            "Starting Telegram polling..."
-        )
+            logger.info("✅ PostgreSQL connected")
+            logger.info("🔥 Starting Telegram polling...")
+
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types()
+            )
+
+        except Exception:
+
+            logger.exception(
+                "❌ Telegram bot crashed"
+            )
+
+            if db:
+                try:
+                    await db.close()
+                except Exception:
+                    pass
+
+                db = None
+
+            logger.info(
+                "🔄 Retry Telegram bot in 10 seconds..."
+            )
+
+            await asyncio.sleep(10)
+
+        finally:
+
+            logger.info(
+                "Telegram bot runner stopped"
+            )
 
         await dp.start_polling(
             bot,
