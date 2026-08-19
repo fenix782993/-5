@@ -49,10 +49,16 @@ def index():
 
 @app.get("/health")
 def health():
+    telegram_status = (
+        "running"
+        if _bot_thread is not None and _bot_thread.is_alive()
+        else "starting"
+    )
+
     return {
         "status": "ok",
         "service": "fenix-report",
-        "telegram_bot": "running"
+        "telegram_bot": telegram_status,
     }, 200
 
 
@@ -60,15 +66,37 @@ def health():
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "0").strip()
+
+try:
+    ADMIN_ID = int(ADMIN_ID_RAW)
+except ValueError:
+    ADMIN_ID = 0
+
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан")
+    raise RuntimeError("BOT_TOKEN не задан в Environment Variables")
+
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан")
+    raise RuntimeError("DATABASE_URL не задан в Environment Variables")
+
+
+# Render/PostgreSQL sometimes gives postgres://
+# asyncpg prefers postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://",
+        "postgresql://",
+        1
+    )
+
+# Remove accidental quotes from Render variable
+DATABASE_URL = DATABASE_URL.strip("\"'")
 
 
 # ============================================================
@@ -86,6 +114,14 @@ dp = Dispatcher(
 
 # PostgreSQL pool
 db: asyncpg.Pool | None = None
+
+
+# ============================================================
+# BOT THREAD VARIABLES
+# ============================================================
+
+_bot_thread = None
+_bot_thread_lock = threading.Lock()
 
 
 # ============================================================
@@ -220,7 +256,7 @@ async def init_db():
             ON complaints(status)
         """)
 
-    logger.info("PostgreSQL initialized")
+    logger.info("PostgreSQL initialized successfully")
 
 
 # ============================================================
@@ -231,6 +267,9 @@ async def upsert_user(message: Message):
 
     if db is None:
         await init_db()
+
+    if message.from_user is None:
+        return
 
     user = message.from_user
 
@@ -303,7 +342,7 @@ async def ensure_user(user_id: int):
 
 async def has_subscription(user_id: int) -> bool:
 
-    # ADMIN всегда имеет доступ
+    # ADMIN always has access
     if user_id == ADMIN_ID:
         return True
 
@@ -328,11 +367,11 @@ async def has_subscription(user_id: int) -> bool:
 
     expires_at = row["expires_at"]
 
-    # Бессрочная
+    # Permanent subscription
     if expires_at is None:
         return True
 
-    # Истёкшая
+    # Expired subscription
     if expires_at <= datetime.now(timezone.utc):
 
         await db.execute("""
@@ -940,6 +979,9 @@ async def complaint_save(
 
         return
 
+    if db is None:
+        await init_db()
+
     await db.execute("""
         INSERT INTO complaints (
             telegram_id,
@@ -1227,6 +1269,9 @@ async def admin_stats(
     if not await admin_required(callback):
         return
 
+    if db is None:
+        await init_db()
+
     users = await db.fetchval("""
         SELECT COUNT(*)
         FROM users
@@ -1278,6 +1323,9 @@ async def admin_users(
     if not await admin_required(callback):
         return
 
+    if db is None:
+        await init_db()
+
     rows = await db.fetch("""
         SELECT
             u.telegram_id,
@@ -1306,9 +1354,15 @@ async def admin_users(
 
         for row in rows:
 
+            active = row["active"]
+
+            if active and row["expires_at"]:
+                if row["expires_at"] <= datetime.now(timezone.utc):
+                    active = False
+
             status = (
                 "✅"
-                if row["active"]
+                if active
                 else "❌"
             )
 
@@ -1561,6 +1615,9 @@ async def admin_remove_sub_user(
 
         return
 
+    if db is None:
+        await init_db()
+
     await db.execute("""
         UPDATE subscriptions
         SET
@@ -1632,6 +1689,9 @@ async def admin_search_result(
 
         return
 
+    if db is None:
+        await init_db()
+
     row = await db.fetchrow("""
         SELECT
             u.telegram_id,
@@ -1682,9 +1742,15 @@ async def admin_search_result(
         else "∞"
     )
 
+    active = bool(row["active"])
+
+    if active and row["expires_at"]:
+        if row["expires_at"] <= datetime.now(timezone.utc):
+            active = False
+
     status = (
         "✅ Активна"
-        if row["active"]
+        if active
         else "❌ Нет"
     )
 
@@ -1717,6 +1783,9 @@ async def admin_complaints(
 
     if not await admin_required(callback):
         return
+
+    if db is None:
+        await init_db()
 
     rows = await db.fetch("""
         SELECT
@@ -1827,6 +1896,9 @@ async def admin_broadcast_send(
 
         return
 
+    if db is None:
+        await init_db()
+
     users = await db.fetch("""
         SELECT telegram_id
         FROM users
@@ -1846,6 +1918,7 @@ async def admin_broadcast_send(
 
             sent += 1
 
+            # Telegram rate limit protection
             await asyncio.sleep(0.05)
 
         except Exception as e:
@@ -1916,63 +1989,79 @@ async def bot_runner():
     logger.info("🔥 FENIX REPORT TELEGRAM STARTING")
     logger.info("====================================")
 
-    while True:
+    try:
 
-        try:
+        while True:
 
-            logger.info("Connecting to PostgreSQL...")
+            try:
 
-            await init_db()
+                logger.info(
+                    "Connecting to PostgreSQL..."
+                )
 
-            logger.info("✅ PostgreSQL connected")
-            logger.info("🔥 Starting Telegram polling...")
+                await init_db()
 
-            await dp.start_polling(
-                bot,
-                allowed_updates=dp.resolve_used_update_types()
-            )
+                logger.info(
+                    "✅ PostgreSQL connected"
+                )
 
-        except Exception:
+                logger.info(
+                    "🔥 Starting Telegram polling..."
+                )
 
-            logger.exception(
-                "❌ Telegram bot crashed"
-            )
+                await dp.start_polling(
+                    bot,
+                    allowed_updates=dp.resolve_used_update_types()
+                )
 
-            if db:
-                try:
-                    await db.close()
-                except Exception:
-                    pass
+                # If polling stops normally, wait before restart.
+                logger.warning(
+                    "Telegram polling stopped normally."
+                )
 
-                db = None
+            except asyncio.CancelledError:
 
-            logger.info(
-                "🔄 Retry Telegram bot in 10 seconds..."
-            )
+                logger.info(
+                    "Telegram bot polling cancelled."
+                )
 
-            await asyncio.sleep(10)
+                raise
 
-        finally:
+            except Exception:
 
-            logger.info(
-                "Telegram bot runner stopped"
-            )
+                logger.exception(
+                    "❌ Telegram bot crashed"
+                )
 
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types()
-        )
+                # Close broken PostgreSQL pool
+                if db is not None:
+
+                    try:
+                        await db.close()
+
+                    except Exception:
+                        logger.exception(
+                            "Error while closing PostgreSQL pool"
+                        )
+
+                    db = None
+
+                logger.info(
+                    "🔄 Retry Telegram bot in 10 seconds..."
+                )
+
+                await asyncio.sleep(10)
 
     except asyncio.CancelledError:
 
         logger.info(
-            "Telegram bot cancelled"
+            "Telegram bot runner cancelled"
         )
 
     except Exception:
 
         logger.exception(
-            "Telegram bot crashed"
+            "❌ Fatal Telegram bot runner error"
         )
 
     finally:
@@ -1981,14 +2070,22 @@ async def bot_runner():
             "Telegram bot runner stopped"
         )
 
+        if db is not None:
+
+            try:
+                await db.close()
+
+            except Exception:
+                logger.exception(
+                    "Error while closing PostgreSQL"
+                )
+
+            db = None
+
 
 # ============================================================
 # START BOT THREAD
 # ============================================================
-
-_bot_thread = None
-_bot_thread_lock = threading.Lock()
-
 
 def start_bot_thread():
 
@@ -2038,17 +2135,13 @@ def start_bot_thread():
 # IMPORTANT FOR GUNICORN
 # ============================================================
 #
-# Render запускает:
+# Render:
 #
-# gunicorn main:app
+# gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
 #
-# Поэтому:
+# Gunicorn импортирует main.py.
 #
-# if __name__ == "__main__":
-#
-# здесь НЕ сработает.
-#
-# Запускаем Telegram polling при импорте main.py.
+# Поэтому start_bot_thread() вызывается при импорте.
 # ============================================================
 
 start_bot_thread()
