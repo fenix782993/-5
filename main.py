@@ -1,14 +1,10 @@
 import os
 import logging
 import asyncio
-import html
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
-
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -35,17 +31,9 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не задан")
 
-if not ADMIN_ID:
-    raise RuntimeError("ADMIN_ID не задан")
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 logger = logging.getLogger("fenix")
@@ -55,511 +43,325 @@ logger = logging.getLogger("fenix")
 # BOT
 # ============================================================
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    ),
-)
-
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-db_pool = None
+db: asyncpg.Pool | None = None
 
 
 # ============================================================
-# STATES
+# CATEGORIES
 # ============================================================
 
-class ReportForm(StatesGroup):
-    target_type = State()
+CATEGORIES = {
+    "spam": "📨 Спам",
+    "phishing": "🎣 Фишинг",
+    "fraud": "💳 Мошенничество",
+    "harassment": "🚫 Домогательство / преследование",
+    "doxxing": "🔐 Раскрытие персональных данных",
+    "copyright": "©️ Авторские права",
+    "privacy": "🛡 Нарушение приватности",
+    "illegal_content": "⚠️ Запрещённый контент",
+    "channel": "📢 Канал",
+    "group": "👥 Группа",
+    "other": "📋 Другое",
+}
+
+
+# ============================================================
+# FSM
+# ============================================================
+
+class ComplaintForm(StatesGroup):
     category = State()
     target = State()
-    description = State()
+    details = State()
+    preview = State()
 
 
-class SubscriptionForm(StatesGroup):
+class AdminSubscription(StatesGroup):
     user_id = State()
-    days = State()
+    duration = State()
+
+
+class AdminSearch(StatesGroup):
+    user_id = State()
+
+
+class AdminBroadcast(StatesGroup):
+    text = State()
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-CREATE_USERS = """
-CREATE TABLE IF NOT EXISTS users (
-    id BIGSERIAL PRIMARY KEY,
-    telegram_id BIGINT UNIQUE NOT NULL,
-    username TEXT,
-    first_name TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+async def init_db():
+    global db
 
-    subscription_until TIMESTAMP NULL,
-    is_blocked BOOLEAN NOT NULL DEFAULT FALSE
-);
-"""
-
-
-CREATE_REPORTS = """
-CREATE TABLE IF NOT EXISTS reports (
-    id BIGSERIAL PRIMARY KEY,
-
-    telegram_user_id BIGINT NOT NULL,
-    telegram_username TEXT,
-
-    target_type TEXT NOT NULL,
-    category TEXT NOT NULL,
-
-    target TEXT NOT NULL,
-    description TEXT NOT NULL,
-
-    generated_text TEXT NOT NULL,
-
-    status TEXT NOT NULL DEFAULT 'NEW',
-
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-"""
-
-
-async def init_database():
-    global db_pool
-
-    db_pool = await asyncpg.create_pool(
+    db = await asyncpg.create_pool(
         DATABASE_URL,
         min_size=1,
-        max_size=10,
+        max_size=5,
     )
 
-    async with db_pool.acquire() as conn:
-        await conn.execute(CREATE_USERS)
-        await conn.execute(CREATE_REPORTS)
+    async with db.acquire() as conn:
 
-    logger.info("PostgreSQL connected")
-
-
-# ============================================================
-# USER
-# ============================================================
-
-async def register_user(user):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO users (
-                telegram_id,
-                username,
-                first_name
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_seen = NOW()
-            """,
-            user.id,
-            user.username,
-            user.first_name,
-        )
+        """)
 
-
-async def get_user(telegram_id):
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            """
-            SELECT *
-            FROM users
-            WHERE telegram_id = $1
-            """,
-            telegram_id,
-        )
-
-
-async def has_subscription(telegram_id):
-    user = await get_user(telegram_id)
-
-    if not user:
-        return False
-
-    if user["is_blocked"]:
-        return False
-
-    subscription_until = user["subscription_until"]
-
-    if not subscription_until:
-        return False
-
-    return subscription_until > datetime.now()
-
-
-async def get_subscription_text(telegram_id):
-    user = await get_user(telegram_id)
-
-    if not user:
-        return "❌ Подписка отсутствует."
-
-    until = user["subscription_until"]
-
-    if not until:
-        return "❌ Подписка отсутствует."
-
-    now = datetime.now()
-
-    if until <= now:
-        return "❌ Подписка истекла."
-
-    remaining = until - now
-    days = remaining.days
-    hours = remaining.seconds // 3600
-
-    return (
-        "💎 <b>Подписка активна</b>\n\n"
-        f"📅 До: <code>{until.strftime('%d.%m.%Y %H:%M')}</code>\n"
-        f"⏳ Осталось: <b>{days} дн. {hours} ч.</b>"
-    )
-
-
-# ============================================================
-# SUBSCRIPTION
-# ============================================================
-
-async def give_subscription(telegram_id, days):
-    until = datetime.now() + timedelta(days=days)
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE users
-            SET subscription_until = $1
-            WHERE telegram_id = $2
-            """,
-            until,
-            telegram_id,
-        )
-
-    return until
-
-
-async def remove_subscription(telegram_id):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE users
-            SET subscription_until = NULL
-            WHERE telegram_id = $1
-            """,
-            telegram_id,
-        )
-
-
-# ============================================================
-# REPORT
-# ============================================================
-
-TYPE_NAMES = {
-    "account": "Аккаунт",
-    "channel": "Канал",
-    "group": "Группа",
-    "message": "Сообщение",
-}
-
-
-CATEGORY_NAMES = {
-    "spam": "Спам",
-    "impersonation": "Выдача себя за другого",
-    "fraud": "Мошенничество",
-    "copyright": "Авторские права",
-    "prohibited": "Запрещённый контент",
-    "other": "Другое",
-}
-
-
-STATUS_NAMES = {
-    "NEW": "🆕 Новый",
-    "WORK": "🔄 В работе",
-    "DONE": "✅ Завершён",
-    "REJECTED": "❌ Отклонён",
-}
-
-
-def generate_report_text(
-    target_type,
-    category,
-    target,
-    description,
-):
-    type_name = TYPE_NAMES.get(
-        target_type,
-        target_type,
-    )
-
-    category_name = CATEGORY_NAMES.get(
-        category,
-        category,
-    )
-
-    return (
-        "Здравствуйте.\n\n"
-        "Хочу сообщить о потенциальном "
-        "нарушении правил Telegram.\n\n"
-        f"Тип объекта: {type_name}\n"
-        f"Объект: {target}\n"
-        f"Категория: {category_name}\n\n"
-        "Описание ситуации:\n"
-        f"{description}\n\n"
-        "Прошу проверить указанную информацию "
-        "и принять соответствующие меры, если "
-        "нарушение подтвердится.\n\n"
-        "Спасибо."
-    )
-
-
-async def create_report(
-    telegram_id,
-    username,
-    target_type,
-    category,
-    target,
-    description,
-    generated_text,
-):
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval(
-            """
-            INSERT INTO reports (
-                telegram_user_id,
-                telegram_username,
-                target_type,
-                category,
-                target,
-                description,
-                generated_text,
-                status
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                telegram_id BIGINT PRIMARY KEY REFERENCES users(telegram_id)
+                    ON DELETE CASCADE,
+                active BOOLEAN NOT NULL DEFAULT FALSE,
+                expires_at TIMESTAMPTZ
             )
-            VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7, 'NEW'
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS complaints (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES users(telegram_id)
+                    ON DELETE CASCADE,
+                category TEXT NOT NULL,
+                target TEXT NOT NULL,
+                details TEXT NOT NULL,
+                generated_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'DRAFT',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-            RETURNING id
-            """,
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_complaints_user
+            ON complaints(telegram_id)
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_complaints_status
+            ON complaints(status)
+        """)
+
+
+async def upsert_user(message: Message):
+    if not db:
+        return
+
+    user = message.from_user
+
+    await db.execute("""
+        INSERT INTO users (
             telegram_id,
             username,
-            target_type,
-            category,
-            target,
-            description,
-            generated_text,
+            first_name,
+            last_seen
         )
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (telegram_id)
+        DO UPDATE SET
+            username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name,
+            last_seen = NOW()
+    """,
+        user.id,
+        user.username,
+        user.first_name,
+    )
+
+    await db.execute("""
+        INSERT INTO subscriptions (
+            telegram_id,
+            active,
+            expires_at
+        )
+        VALUES ($1, FALSE, NULL)
+        ON CONFLICT (telegram_id) DO NOTHING
+    """, user.id)
+
+
+async def has_subscription(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+
+    row = await db.fetchrow("""
+        SELECT active, expires_at
+        FROM subscriptions
+        WHERE telegram_id = $1
+    """, user_id)
+
+    if not row:
+        return False
+
+    if not row["active"]:
+        return False
+
+    expires_at = row["expires_at"]
+
+    if expires_at is None:
+        return True
+
+    return expires_at > datetime.now(timezone.utc)
 
 
 # ============================================================
 # KEYBOARDS
 # ============================================================
 
-def main_keyboard():
+def main_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="👤 Аккаунт",
-                    callback_data="type:account",
-                ),
-                InlineKeyboardButton(
-                    text="📢 Канал",
-                    callback_data="type:channel",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👥 Группа",
-                    callback_data="type:group",
-                ),
-                InlineKeyboardButton(
-                    text="💬 Сообщение",
-                    callback_data="type:message",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💎 Моя подписка",
-                    callback_data="subscription",
-                ),
+                    text="📝 Создать обращение",
+                    callback_data="complaint_create"
+                )
             ],
             [
                 InlineKeyboardButton(
                     text="📋 Мои обращения",
-                    callback_data="my_reports",
+                    callback_data="my_complaints"
                 ),
-            ],
-        ]
-    )
-
-
-def categories_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
                 InlineKeyboardButton(
-                    text="🚫 Спам",
-                    callback_data="category:spam",
+                    text="👤 Профиль",
+                    callback_data="profile"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🎭 Выдача себя за другого",
-                    callback_data="category:impersonation",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💰 Мошенничество",
-                    callback_data="category:fraud",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="©️ Авторские права",
-                    callback_data="category:copyright",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔞 Запрещённый контент",
-                    callback_data="category:prohibited",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⚠️ Другое",
-                    callback_data="category:other",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Отмена",
-                    callback_data="cancel",
+                    text="ℹ️ Помощь",
+                    callback_data="help"
                 )
             ],
         ]
     )
 
 
-def preview_keyboard():
+def subscription_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Создать обращение",
-                    callback_data="report:confirm",
+                    text="🔄 Проверить подписку",
+                    callback_data="check_subscription"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🔄 Заново",
-                    callback_data="report:restart",
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отмена",
-                    callback_data="cancel",
-                ),
-            ],
-        ]
-    )
-
-
-def admin_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="admin:stats",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📋 Все обращения",
-                    callback_data="admin:reports",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🆕 Новые",
-                    callback_data="admin:reports:NEW",
-                ),
-                InlineKeyboardButton(
-                    text="🔄 В работе",
-                    callback_data="admin:reports:WORK",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✅ Завершённые",
-                    callback_data="admin:reports:DONE",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👥 Пользователи",
-                    callback_data="admin:users",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💎 Выдать подписку",
-                    callback_data="admin:subscription",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Снять подписку",
-                    callback_data="admin:remove_sub",
-                ),
-            ],
-        ]
-    )
-
-
-def back_admin_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Админ-панель",
-                    callback_data="admin:home",
+                    text="⬅️ Назад",
+                    callback_data="back_main"
                 )
             ]
         ]
     )
 
 
-def report_status_keyboard(report_id):
+def category_menu():
+    buttons = []
+
+    items = list(CATEGORIES.items())
+
+    for i in range(0, len(items), 2):
+        row = []
+
+        for key, title in items[i:i + 2]:
+            row.append(
+                InlineKeyboardButton(
+                    text=title,
+                    callback_data=f"category:{key}"
+                )
+            )
+
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data="cancel"
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def preview_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔄 В работу",
-                    callback_data=f"status:{report_id}:WORK",
-                ),
+                    text="✅ Сохранить обращение",
+                    callback_data="complaint_save"
+                )
             ],
             [
                 InlineKeyboardButton(
-                    text="✅ Завершить",
-                    callback_data=f"status:{report_id}:DONE",
+                    text="✏️ Изменить",
+                    callback_data="complaint_edit"
                 ),
                 InlineKeyboardButton(
-                    text="❌ Отклонить",
-                    callback_data=f"status:{report_id}:REJECTED",
+                    text="❌ Отмена",
+                    callback_data="cancel"
+                )
+            ],
+        ]
+    )
+
+
+def admin_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="admin_stats"
                 ),
+                InlineKeyboardButton(
+                    text="👥 Пользователи",
+                    callback_data="admin_users"
+                )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="admin:reports",
+                    text="➕ Выдать подписку",
+                    callback_data="admin_give_sub"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➖ Забрать подписку",
+                    callback_data="admin_remove_sub"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 Найти пользователя",
+                    callback_data="admin_search"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Обращения",
+                    callback_data="admin_complaints"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 Рассылка",
+                    callback_data="admin_broadcast"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Главное меню",
+                    callback_data="back_main"
                 )
             ],
         ]
@@ -567,17 +369,21 @@ def report_status_keyboard(report_id):
 
 
 # ============================================================
-# ACCESS
+# TEXT GENERATOR
 # ============================================================
 
-async def check_access(
-    callback: CallbackQuery,
-):
-    if callback.from_user.id == ADMIN_ID:
-        return True
+def generate_complaint(category: str, target: str, details: str) -> str:
+    category_name = CATEGORIES.get(category, "Другое")
 
-    return await has_subscription(
-        callback.from_user.id
+    return (
+        "Здравствуйте.\n\n"
+        f"Хочу сообщить о возможном нарушении категории: "
+        f"{category_name}.\n\n"
+        f"Объект обращения: {target}\n\n"
+        f"Описание ситуации:\n{details}\n\n"
+        "Прошу проверить указанную информацию и принять "
+        "соответствующие меры, если нарушение подтвердится.\n\n"
+        "Спасибо."
     )
 
 
@@ -588,378 +394,371 @@ async def check_access(
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
+    await upsert_user(message)
 
-    await register_user(
-        message.from_user
-    )
+    subscribed = await has_subscription(message.from_user.id)
 
-    if await has_subscription(
-        message.from_user.id
-    ):
+    if not subscribed and message.from_user.id != ADMIN_ID:
         await message.answer(
-            "<b>🔥 FENIX REPORT</b>\n\n"
-            "💎 Подписка активна.\n\n"
-            "Выберите действие:",
-            reply_markup=main_keyboard(),
+            "🔥 <b>FENIX REPORT</b>\n\n"
+            "Доступ к системе обращений закрыт.\n\n"
+            "🔐 Для использования сервиса необходима "
+            "активная подписка.\n\n"
+            "Обратитесь к администратору.",
+            parse_mode="HTML",
+            reply_markup=subscription_menu()
         )
         return
 
     await message.answer(
-        "<b>🔥 FENIX REPORT</b>\n\n"
-        "⛔ Доступ закрыт.\n\n"
-        "Для использования системы "
-        "необходима активная подписка.\n\n"
-        "Выдать её может только администратор."
+        "🔥 <b>FENIX REPORT</b>\n\n"
+        "Добро пожаловать.\n\n"
+        "Выберите нужный раздел:",
+        parse_mode="HTML",
+        reply_markup=main_menu()
     )
 
 
 # ============================================================
-# SUBSCRIPTION
+# PROFILE
 # ============================================================
 
-@dp.callback_query(F.data == "subscription")
-async def subscription(
-    callback: CallbackQuery,
-):
-    if not await check_access(callback):
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    row = await db.fetchrow("""
+        SELECT active, expires_at
+        FROM subscriptions
+        WHERE telegram_id = $1
+    """, user_id)
+
+    complaints = await db.fetchval("""
+        SELECT COUNT(*)
+        FROM complaints
+        WHERE telegram_id = $1
+    """, user_id)
+
+    active = row and row["active"]
+
+    if row and row["expires_at"]:
+        expires = row["expires_at"].strftime("%d.%m.%Y %H:%M")
+    else:
+        expires = "∞"
+
+    text = (
+        "👤 <b>ПРОФИЛЬ</b>\n\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"👤 Username: @{callback.from_user.username or 'нет'}\n\n"
+        f"🔐 Подписка: {'✅ АКТИВНА' if active else '❌ НЕТ'}\n"
+        f"📅 До: {expires}\n"
+        f"📋 Обращений: {complaints}"
+    )
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# CHECK SUBSCRIPTION
+# ============================================================
+
+@dp.callback_query(F.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery):
+    if await has_subscription(callback.from_user.id):
+        await callback.message.edit_text(
+            "✅ <b>Подписка активна.</b>\n\n"
+            "Теперь вам доступен FENIX REPORT.",
+            parse_mode="HTML",
+            reply_markup=main_menu()
+        )
+    else:
         await callback.answer(
-            "⛔ Нет активной подписки",
-            show_alert=True,
+            "❌ Активной подписки нет.",
+            show_alert=True
+        )
+
+    await callback.answer()
+
+
+# ============================================================
+# CREATE COMPLAINT
+# ============================================================
+
+@dp.callback_query(F.data == "complaint_create")
+async def complaint_create(callback: CallbackQuery, state: FSMContext):
+
+    if not await has_subscription(callback.from_user.id):
+        await callback.answer(
+            "🔐 Нужна активная подписка.",
+            show_alert=True
         )
         return
 
+    await state.clear()
+    await state.set_state(ComplaintForm.category)
+
     await callback.message.edit_text(
-        await get_subscription_text(
-            callback.from_user.id
-        ),
+        "📝 <b>СОЗДАНИЕ ОБРАЩЕНИЯ</b>\n\n"
+        "Шаг 1/3\n\n"
+        "Выберите категорию:",
+        parse_mode="HTML",
+        reply_markup=category_menu()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("category:"))
+async def select_category(callback: CallbackQuery, state: FSMContext):
+
+    category = callback.data.split(":", 1)[1]
+
+    await state.update_data(category=category)
+    await state.set_state(ComplaintForm.target)
+
+    await callback.message.edit_text(
+        "🎯 <b>ШАГ 2/3</b>\n\n"
+        "Отправьте <code>@username</code> или ссылку "
+        "на профиль/канал/группу.",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⬅️ Назад",
-                        callback_data="back:main",
+                        text="❌ Отмена",
+                        callback_data="cancel"
                     )
                 ]
             ]
-        ),
+        )
     )
 
     await callback.answer()
 
 
-# ============================================================
-# CREATE REPORT - TYPE
-# ============================================================
+@dp.message(ComplaintForm.target)
+async def complaint_target(message: Message, state: FSMContext):
 
-@dp.callback_query(F.data.startswith("type:"))
-async def choose_type(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    if not await check_access(callback):
-        await callback.answer(
-            "⛔ Необходима подписка",
-            show_alert=True,
-        )
-        return
+    target = message.text.strip()
 
-    target_type = callback.data.split(":")[1]
-
-    await state.update_data(
-        target_type=target_type
-    )
-
-    await state.set_state(
-        ReportForm.category
-    )
-
-    await callback.message.edit_text(
-        "<b>⚠️ Выберите категорию</b>",
-        reply_markup=categories_keyboard(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# CATEGORY
-# ============================================================
-
-@dp.callback_query(F.data.startswith("category:"))
-async def choose_category(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    if not await check_access(callback):
-        await callback.answer(
-            "⛔ Необходима подписка",
-            show_alert=True,
-        )
-        return
-
-    category = callback.data.split(":")[1]
-
-    await state.update_data(
-        category=category
-    )
-
-    await state.set_state(
-        ReportForm.target
-    )
-
-    await callback.message.edit_text(
-        "<b>🔗 Отправьте объект</b>\n\n"
-        "Можно отправить:\n\n"
-        "• @username\n"
-        "• https://t.me/username\n"
-        "• ссылку на сообщение",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# TARGET
-# ============================================================
-
-@dp.message(ReportForm.target)
-async def target(
-    message: Message,
-    state: FSMContext,
-):
-    if not await has_subscription(
-        message.from_user.id
-    ):
-        await state.clear()
-
+    if len(target) < 2:
         await message.answer(
-            "⛔ Ваша подписка отсутствует "
-            "или истекла."
+            "⚠️ Укажите корректный username или ссылку."
         )
         return
 
-    value = (message.text or "").strip()
-
-    if len(value) < 2:
-        await message.answer(
-            "⚠️ Укажите @username или ссылку."
-        )
-        return
-
-    if len(value) > 500:
-        await message.answer(
-            "⚠️ Слишком длинное значение."
-        )
-        return
-
-    await state.update_data(
-        target=value
-    )
-
-    await state.set_state(
-        ReportForm.description
-    )
+    await state.update_data(target=target)
+    await state.set_state(ComplaintForm.details)
 
     await message.answer(
-        "<b>📝 Опишите ситуацию</b>\n\n"
-        "Напишите реальные обстоятельства "
-        "нарушения."
+        "📝 <b>ШАГ 3/3</b>\n\n"
+        "Опишите фактическую ситуацию.\n\n"
+        "Не добавляйте вымышленные сведения — обращение "
+        "будет сформировано на основании вашего текста.",
+        parse_mode="HTML"
     )
 
 
-# ============================================================
-# DESCRIPTION
-# ============================================================
+@dp.message(ComplaintForm.details)
+async def complaint_details(message: Message, state: FSMContext):
 
-@dp.message(ReportForm.description)
-async def description(
-    message: Message,
-    state: FSMContext,
-):
-    if not await has_subscription(
-        message.from_user.id
-    ):
-        await state.clear()
+    details = message.text.strip()
 
+    if len(details) < 10:
         await message.answer(
-            "⛔ Ваша подписка истекла."
+            "⚠️ Описание слишком короткое.\n"
+            "Опишите ситуацию подробнее."
         )
         return
-
-    value = (message.text or "").strip()
-
-    if len(value) < 10:
-        await message.answer(
-            "⚠️ Нужно добавить больше информации."
-        )
-        return
-
-    if len(value) > 4000:
-        await message.answer(
-            "⚠️ Максимум 4000 символов."
-        )
-        return
-
-    await state.update_data(
-        description=value
-    )
 
     data = await state.get_data()
 
-    generated = generate_report_text(
-        data["target_type"],
+    category = data["category"]
+    target = data["target"]
+
+    generated = generate_complaint(
+        category,
+        target,
+        details
+    )
+
+    await state.update_data(
+        details=details,
+        generated=generated
+    )
+
+    await state.set_state(ComplaintForm.preview)
+
+    await message.answer(
+        "👀 <b>ПРЕДПРОСМОТР</b>\n\n"
+        f"{generated}\n\n"
+        "Отправить это обращение в историю?",
+        parse_mode="HTML",
+        reply_markup=preview_menu()
+    )
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+@dp.callback_query(F.data == "complaint_save")
+async def complaint_save(callback: CallbackQuery, state: FSMContext):
+
+    if not await has_subscription(callback.from_user.id):
+        await callback.answer(
+            "❌ Подписка закончилась.",
+            show_alert=True
+        )
+        await state.clear()
+        return
+
+    data = await state.get_data()
+
+    await db.execute("""
+        INSERT INTO complaints (
+            telegram_id,
+            category,
+            target,
+            details,
+            generated_text,
+            status
+        )
+        VALUES ($1, $2, $3, $4, $5, 'SAVED')
+    """,
+        callback.from_user.id,
         data["category"],
         data["target"],
-        data["description"],
-    )
-
-    await state.update_data(
-        generated_text=generated
-    )
-
-    preview = (
-        "<b>📋 ПРЕДПРОСМОТР</b>\n\n"
-        f"<b>Тип:</b> "
-        f"{html.escape(TYPE_NAMES[data['target_type']])}\n"
-        f"<b>Категория:</b> "
-        f"{html.escape(CATEGORY_NAMES[data['category']])}\n"
-        f"<b>Объект:</b> "
-        f"{html.escape(data['target'])}\n\n"
-        "<b>Сформированный текст:</b>\n\n"
-        f"{html.escape(generated)}"
-    )
-
-    await message.answer(
-        preview,
-        reply_markup=preview_keyboard(),
-    )
-
-
-# ============================================================
-# CONFIRM REPORT
-# ============================================================
-
-@dp.callback_query(F.data == "report:confirm")
-async def confirm_report(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    if not await check_access(callback):
-        await callback.answer(
-            "⛔ Подписка отсутствует",
-            show_alert=True,
-        )
-        await state.clear()
-        return
-
-    data = await state.get_data()
-
-    if not data:
-        await callback.answer(
-            "Сессия устарела.",
-            show_alert=True,
-        )
-        return
-
-    report_id = await create_report(
-        telegram_id=callback.from_user.id,
-        username=callback.from_user.username,
-        target_type=data["target_type"],
-        category=data["category"],
-        target=data["target"],
-        description=data["description"],
-        generated_text=data["generated_text"],
+        data["details"],
+        data["generated"],
     )
 
     await state.clear()
 
     await callback.message.edit_text(
-        "<b>✅ Обращение создано</b>\n\n"
-        f"🆔 ID: <code>#{report_id}</code>\n"
-        "📌 Статус: <b>NEW</b>\n\n"
-        "Обращение сохранено в PostgreSQL.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🏠 Главное меню",
-                        callback_data="back:main",
-                    )
-                ]
-            ]
-        ),
+        "✅ <b>Обращение сохранено.</b>\n\n"
+        "Оно находится в разделе «Мои обращения».",
+        parse_mode="HTML",
+        reply_markup=main_menu()
     )
 
-    await callback.answer("Готово!")
+    await callback.answer("Сохранено")
 
 
 # ============================================================
-# MY REPORTS
+# EDIT
 # ============================================================
 
-@dp.callback_query(F.data == "my_reports")
-async def my_reports(
-    callback: CallbackQuery,
-):
-    if not await check_access(callback):
-        await callback.answer(
-            "⛔ Необходима подписка",
-            show_alert=True,
-        )
-        return
+@dp.callback_query(F.data == "complaint_edit")
+async def complaint_edit(callback: CallbackQuery, state: FSMContext):
 
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                id,
-                target_type,
-                category,
-                target,
-                status,
-                created_at
-            FROM reports
-            WHERE telegram_user_id = $1
-            ORDER BY id DESC
-            LIMIT 20
-            """,
-            callback.from_user.id,
-        )
+    await state.set_state(ComplaintForm.details)
+
+    await callback.message.edit_text(
+        "✏️ Отправьте новое описание ситуации:"
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# MY COMPLAINTS
+# ============================================================
+
+@dp.callback_query(F.data == "my_complaints")
+async def my_complaints(callback: CallbackQuery):
+
+    rows = await db.fetch("""
+        SELECT id, category, target, status, created_at
+        FROM complaints
+        WHERE telegram_id = $1
+        ORDER BY id DESC
+        LIMIT 10
+    """, callback.from_user.id)
 
     if not rows:
         text = (
-            "<b>📋 Мои обращения</b>\n\n"
-            "Обращений пока нет."
+            "📋 <b>МОИ ОБРАЩЕНИЯ</b>\n\n"
+            "У вас пока нет обращений."
         )
     else:
-        text = "<b>📋 Мои обращения</b>\n\n"
+        lines = ["📋 <b>МОИ ОБРАЩЕНИЯ</b>\n"]
 
         for row in rows:
-            status = STATUS_NAMES.get(
-                row["status"],
-                row["status"],
+            lines.append(
+                f"#{row['id']} | "
+                f"{CATEGORIES.get(row['category'], row['category'])}\n"
+                f"🎯 {row['target']}\n"
+                f"📌 {row['status']}\n"
             )
 
-            text += (
-                f"🆔 <code>#{row['id']}</code>\n"
-                f"🎯 {TYPE_NAMES.get(row['target_type'])}\n"
-                f"⚠️ {CATEGORY_NAMES.get(row['category'])}\n"
-                f"🔗 {html.escape(row['target'])}\n"
-                f"📌 {status}\n\n"
-            )
+        text = "\n".join(lines)
 
     await callback.message.edit_text(
         text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ Назад",
-                        callback_data="back:main",
-                    )
-                ]
-            ]
-        ),
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+@dp.callback_query(F.data == "help")
+async def help_menu(callback: CallbackQuery):
+
+    await callback.message.edit_text(
+        "ℹ️ <b>FENIX REPORT — ПОМОЩЬ</b>\n\n"
+        "1️⃣ Нажмите «Создать обращение».\n"
+        "2️⃣ Выберите категорию.\n"
+        "3️⃣ Укажите @username или ссылку.\n"
+        "4️⃣ Опишите фактическую ситуацию.\n"
+        "5️⃣ Проверьте автоматически сформированный текст.\n"
+        "6️⃣ Сохраните обращение.\n\n"
+        "Все обращения сохраняются в PostgreSQL.",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# CANCEL
+# ============================================================
+
+@dp.callback_query(F.data == "cancel")
+async def cancel(callback: CallbackQuery, state: FSMContext):
+
+    await state.clear()
+
+    await callback.message.edit_text(
+        "❌ Операция отменена.",
+        reply_markup=main_menu()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery, state: FSMContext):
+
+    await state.clear()
+
+    await callback.message.edit_text(
+        "🔥 <b>FENIX REPORT</b>\n\n"
+        "Главное меню:",
+        parse_mode="HTML",
+        reply_markup=main_menu()
     )
 
     await callback.answer()
@@ -969,15 +768,16 @@ async def my_reports(
 # ADMIN CHECK
 # ============================================================
 
-def is_admin(user_id):
+def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
-async def admin_only(callback):
+async def admin_required(callback: CallbackQuery) -> bool:
+
     if not is_admin(callback.from_user.id):
         await callback.answer(
             "⛔ Доступ запрещён.",
-            show_alert=True,
+            show_alert=True
         )
         return False
 
@@ -985,118 +785,68 @@ async def admin_only(callback):
 
 
 # ============================================================
-# /ADMIN
+# ADMIN COMMAND
 # ============================================================
 
 @dp.message(Command("admin"))
-async def admin_command(
-    message: Message,
-):
-    await register_user(
-        message.from_user
-    )
+async def admin_command(message: Message):
 
-    if not is_admin(
-        message.from_user.id
-    ):
-        await message.answer(
-            "⛔ У вас нет доступа к админ-панели."
-        )
+    await upsert_user(message)
+
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
         return
 
     await message.answer(
-        "<b>👑 FENIX ADMIN</b>\n\n"
-        "Панель управления:",
-        reply_markup=admin_keyboard(),
+        "👑 <b>FENIX ADMIN</b>\n\n"
+        "Панель администратора:",
+        parse_mode="HTML",
+        reply_markup=admin_menu()
     )
-
-
-# ============================================================
-# ADMIN HOME
-# ============================================================
-
-@dp.callback_query(F.data == "admin:home")
-async def admin_home(
-    callback: CallbackQuery,
-):
-    if not await admin_only(callback):
-        return
-
-    await callback.message.edit_text(
-        "<b>👑 FENIX ADMIN</b>\n\n"
-        "Панель управления:",
-        reply_markup=admin_keyboard(),
-    )
-
-    await callback.answer()
 
 
 # ============================================================
 # ADMIN STATS
 # ============================================================
 
-@dp.callback_query(F.data == "admin:stats")
-async def admin_stats(
-    callback: CallbackQuery,
-):
-    if not await admin_only(callback):
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+
+    if not await admin_required(callback):
         return
 
-    async with db_pool.acquire() as conn:
+    users = await db.fetchval("""
+        SELECT COUNT(*) FROM users
+    """)
 
-        users = await conn.fetchval(
-            "SELECT COUNT(*) FROM users"
-        )
+    active_subs = await db.fetchval("""
+        SELECT COUNT(*)
+        FROM subscriptions
+        WHERE active = TRUE
+          AND (
+              expires_at IS NULL
+              OR expires_at > NOW()
+          )
+    """)
 
-        active_subs = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM users
-            WHERE subscription_until > NOW()
-            """
-        )
+    complaints = await db.fetchval("""
+        SELECT COUNT(*) FROM complaints
+    """)
 
-        reports = await conn.fetchval(
-            "SELECT COUNT(*) FROM reports"
-        )
-
-        new_reports = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM reports
-            WHERE status = 'NEW'
-            """
-        )
-
-        work_reports = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM reports
-            WHERE status = 'WORK'
-            """
-        )
-
-        done_reports = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM reports
-            WHERE status = 'DONE'
-            """
-        )
-
-    text = (
-        "<b>📊 FENIX STATISTICS</b>\n\n"
-        f"👥 Пользователей: <b>{users}</b>\n"
-        f"💎 Активных подписок: <b>{active_subs}</b>\n\n"
-        f"📋 Всего обращений: <b>{reports}</b>\n"
-        f"🆕 Новых: <b>{new_reports}</b>\n"
-        f"🔄 В работе: <b>{work_reports}</b>\n"
-        f"✅ Завершено: <b>{done_reports}</b>"
-    )
+    saved = await db.fetchval("""
+        SELECT COUNT(*)
+        FROM complaints
+        WHERE status = 'SAVED'
+    """)
 
     await callback.message.edit_text(
-        text,
-        reply_markup=back_admin_keyboard(),
+        "📊 <b>СТАТИСТИКА FENIX</b>\n\n"
+        f"👥 Пользователей: <b>{users}</b>\n"
+        f"🔐 Активных подписок: <b>{active_subs}</b>\n"
+        f"📋 Обращений: <b>{complaints}</b>\n"
+        f"💾 Сохранённых: <b>{saved}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_menu()
     )
 
     await callback.answer()
@@ -1106,517 +856,370 @@ async def admin_stats(
 # ADMIN USERS
 # ============================================================
 
-@dp.callback_query(F.data == "admin:users")
-async def admin_users(
-    callback: CallbackQuery,
-):
-    if not await admin_only(callback):
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+
+    if not await admin_required(callback):
         return
 
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                telegram_id,
-                username,
-                subscription_until,
-                created_at
-            FROM users
-            ORDER BY created_at DESC
-            LIMIT 20
-            """
-        )
-
-    text = "<b>👥 ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ</b>\n\n"
+    rows = await db.fetch("""
+        SELECT
+            u.telegram_id,
+            u.username,
+            s.active,
+            s.expires_at
+        FROM users u
+        LEFT JOIN subscriptions s
+            ON s.telegram_id = u.telegram_id
+        ORDER BY u.last_seen DESC
+        LIMIT 15
+    """)
 
     if not rows:
-        text += "Пользователей нет."
+        text = "👥 Пользователей пока нет."
     else:
+        lines = ["👥 <b>ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ</b>\n"]
+
         for row in rows:
+            status = "✅" if row["active"] else "❌"
+
             username = (
                 f"@{row['username']}"
                 if row["username"]
                 else "без username"
             )
 
-            active = (
-                "💎"
-                if row["subscription_until"]
-                and row["subscription_until"] > datetime.now()
-                else "⛔"
+            lines.append(
+                f"{status} <code>{row['telegram_id']}</code> "
+                f"{username}"
             )
 
-            text += (
-                f"{active} <code>{row['telegram_id']}</code> "
-                f"{html.escape(username)}\n"
-            )
+        text = "\n".join(lines)
 
     await callback.message.edit_text(
         text,
-        reply_markup=back_admin_keyboard(),
+        parse_mode="HTML",
+        reply_markup=admin_menu()
     )
 
     await callback.answer()
 
 
 # ============================================================
-# ADMIN REPORTS
+# GIVE SUBSCRIPTION
 # ============================================================
 
-async def show_admin_reports(
-    callback: CallbackQuery,
-    status=None,
-):
-    if not await admin_only(callback):
+@dp.callback_query(F.data == "admin_give_sub")
+async def admin_give_sub(callback: CallbackQuery, state: FSMContext):
+
+    if not await admin_required(callback):
         return
 
-    async with db_pool.acquire() as conn:
+    await state.set_state(AdminSubscription.user_id)
 
-        if status:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id,
-                    telegram_user_id,
-                    telegram_username,
-                    target_type,
-                    category,
-                    target,
-                    status,
-                    created_at
-                FROM reports
-                WHERE status = $1
-                ORDER BY id DESC
-                LIMIT 20
-                """,
-                status,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id,
-                    telegram_user_id,
-                    telegram_username,
-                    target_type,
-                    category,
-                    target,
-                    status,
-                    created_at
-                FROM reports
-                ORDER BY id DESC
-                LIMIT 20
-                """
-            )
-
-    title = (
-        STATUS_NAMES.get(status, "📋 Все обращения")
-        if status
-        else "📋 Все обращения"
+    await callback.message.edit_text(
+        "➕ <b>ВЫДАТЬ ПОДПИСКУ</b>\n\n"
+        "Введите Telegram ID пользователя:",
+        parse_mode="HTML"
     )
 
-    text = f"<b>{title}</b>\n\n"
+    await callback.answer()
+
+
+@dp.message(AdminSubscription.user_id)
+async def admin_subscription_user(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ ID должен быть числом.")
+        return
+
+    await state.update_data(user_id=user_id)
+    await state.set_state(AdminSubscription.duration)
+
+    await message.answer(
+        "⏱ Выберите срок подписки:\n\n"
+        "1 — 1 день\n"
+        "7 — 7 дней\n"
+        "30 — 30 дней\n"
+        "0 — навсегда\n\n"
+        "Введите число:"
+    )
+
+
+@dp.message(AdminSubscription.duration)
+async def admin_subscription_duration(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        days = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите число.")
+        return
+
+    if days < 0:
+        await message.answer("❌ Неверный срок.")
+        return
+
+    data = await state.get_data()
+    user_id = data["user_id"]
+
+    await db.execute("""
+        INSERT INTO users (
+            telegram_id
+        )
+        VALUES ($1)
+        ON CONFLICT DO NOTHING
+    """, user_id)
+
+    if days == 0:
+        expires_at = None
+    else:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+
+    await db.execute("""
+        INSERT INTO subscriptions (
+            telegram_id,
+            active,
+            expires_at
+        )
+        VALUES ($1, TRUE, $2)
+        ON CONFLICT (telegram_id)
+        DO UPDATE SET
+            active = TRUE,
+            expires_at = EXCLUDED.expires_at
+    """,
+        user_id,
+        expires_at
+    )
+
+    await state.clear()
+
+    expiration = (
+        "навсегда"
+        if expires_at is None
+        else expires_at.strftime("%d.%m.%Y %H:%M")
+    )
+
+    await message.answer(
+        "✅ <b>Подписка выдана.</b>\n\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"До: <b>{expiration}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_menu()
+    )
+
+    try:
+        await bot.send_message(
+            user_id,
+            "🔥 <b>FENIX REPORT</b>\n\n"
+            "Вам выдан доступ к системе.",
+            parse_mode="HTML",
+            reply_markup=main_menu()
+        )
+    except Exception as e:
+        logger.warning(
+            "Не удалось уведомить пользователя %s: %s",
+            user_id,
+            e
+        )
+
+
+# ============================================================
+# REMOVE SUBSCRIPTION
+# ============================================================
+
+@dp.callback_query(F.data == "admin_remove_sub")
+async def admin_remove_sub(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if not await admin_required(callback):
+        return
+
+    await state.set_state(AdminSearch.user_id)
+
+    await callback.message.edit_text(
+        "➖ <b>ЗАБРАТЬ ПОДПИСКУ</b>\n\n"
+        "Введите Telegram ID:",
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+@dp.message(AdminSearch.user_id)
+async def admin_remove_sub_user(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ ID должен быть числом.")
+        return
+
+    await db.execute("""
+        UPDATE subscriptions
+        SET active = FALSE,
+            expires_at = NOW()
+        WHERE telegram_id = $1
+    """, user_id)
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Подписка отключена.\n\n"
+        f"ID: <code>{user_id}</code>",
+        parse_mode="HTML",
+        reply_markup=admin_menu()
+    )
+
+
+# ============================================================
+# ADMIN SEARCH
+# ============================================================
+
+@dp.callback_query(F.data == "admin_search")
+async def admin_search(callback: CallbackQuery, state: FSMContext):
+
+    if not await admin_required(callback):
+        return
+
+    await state.set_state(AdminSearch.user_id)
+
+    await callback.message.edit_text(
+        "🔎 <b>ПОИСК</b>\n\n"
+        "Введите Telegram ID пользователя:",
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# ADMIN COMPLAINTS
+# ============================================================
+
+@dp.callback_query(F.data == "admin_complaints")
+async def admin_complaints(callback: CallbackQuery):
+
+    if not await admin_required(callback):
+        return
+
+    rows = await db.fetch("""
+        SELECT
+            id,
+            telegram_id,
+            category,
+            target,
+            status,
+            created_at
+        FROM complaints
+        ORDER BY id DESC
+        LIMIT 20
+    """)
 
     if not rows:
-        text += "Обращений нет."
+        text = "📋 Обращений пока нет."
+    else:
+        lines = ["📋 <b>ПОСЛЕДНИЕ ОБРАЩЕНИЯ</b>\n"]
 
-    for row in rows:
-        username = (
-            f"@{row['telegram_username']}"
-            if row["telegram_username"]
-            else str(row["telegram_user_id"])
-        )
-
-        text += (
-            f"🆔 <code>#{row['id']}</code>\n"
-            f"👤 {html.escape(username)}\n"
-            f"🎯 {TYPE_NAMES.get(row['target_type'])}\n"
-            f"⚠️ {CATEGORY_NAMES.get(row['category'])}\n"
-            f"🔗 {html.escape(row['target'])}\n"
-            f"📌 {STATUS_NAMES.get(row['status'])}\n\n"
-        )
-
-    keyboard = []
-
-    for row in rows[:10]:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    text=f"👁 #{row['id']}",
-                    callback_data=f"admin:report:{row['id']}",
-                )
-            ]
-        )
-
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ Админ-панель",
-                callback_data="admin:home",
+        for row in rows:
+            lines.append(
+                f"#{row['id']} | "
+                f"<code>{row['telegram_id']}</code>\n"
+                f"{CATEGORIES.get(row['category'], row['category'])}\n"
+                f"🎯 {row['target']}\n"
+                f"📌 {row['status']}\n"
             )
-        ]
-    )
+
+        text = "\n".join(lines)
 
     await callback.message.edit_text(
         text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=keyboard
-        ),
+        parse_mode="HTML",
+        reply_markup=admin_menu()
     )
 
     await callback.answer()
 
 
-@dp.callback_query(F.data == "admin:reports")
-async def admin_reports(
-    callback: CallbackQuery,
-):
-    await show_admin_reports(callback)
-
-
-@dp.callback_query(F.data.startswith("admin:reports:"))
-async def admin_reports_status(
-    callback: CallbackQuery,
-):
-    status = callback.data.split(":")[-1]
-
-    await show_admin_reports(
-        callback,
-        status,
-    )
-
-
 # ============================================================
-# ADMIN REPORT DETAILS
+# ADMIN BROADCAST
 # ============================================================
 
-@dp.callback_query(F.data.startswith("admin:report:"))
-async def admin_report_details(
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast(
     callback: CallbackQuery,
+    state: FSMContext
 ):
-    if not await admin_only(callback):
+
+    if not await admin_required(callback):
         return
 
-    report_id = int(
-        callback.data.split(":")[-1]
-    )
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT *
-            FROM reports
-            WHERE id = $1
-            """,
-            report_id,
-        )
-
-    if not row:
-        await callback.answer(
-            "Обращение не найдено.",
-            show_alert=True,
-        )
-        return
-
-    username = (
-        f"@{row['telegram_username']}"
-        if row["telegram_username"]
-        else str(row["telegram_user_id"])
-    )
-
-    text = (
-        f"<b>📋 ОБРАЩЕНИЕ #{row['id']}</b>\n\n"
-        f"👤 Пользователь: "
-        f"{html.escape(username)}\n"
-        f"🆔 ID: <code>{row['telegram_user_id']}</code>\n"
-        f"🎯 Тип: {TYPE_NAMES.get(row['target_type'])}\n"
-        f"⚠️ Категория: "
-        f"{CATEGORY_NAMES.get(row['category'])}\n"
-        f"🔗 Объект: "
-        f"{html.escape(row['target'])}\n\n"
-        f"<b>📝 Описание:</b>\n"
-        f"{html.escape(row['description'])}\n\n"
-        f"<b>📄 Текст:</b>\n"
-        f"{html.escape(row['generated_text'])}\n\n"
-        f"📌 Статус: "
-        f"<b>{STATUS_NAMES.get(row['status'])}</b>"
-    )
+    await state.set_state(AdminBroadcast.text)
 
     await callback.message.edit_text(
-        text,
-        reply_markup=report_status_keyboard(
-            report_id
-        ),
+        "📢 <b>РАССЫЛКА</b>\n\n"
+        "Введите текст сообщения:",
+        parse_mode="HTML"
     )
 
     await callback.answer()
 
 
-# ============================================================
-# ADMIN CHANGE STATUS
-# ============================================================
-
-@dp.callback_query(F.data.startswith("status:"))
-async def change_status(
-    callback: CallbackQuery,
-):
-    if not await admin_only(callback):
-        return
-
-    _, report_id, status = (
-        callback.data.split(":")
-    )
-
-    report_id = int(report_id)
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE reports
-            SET
-                status = $1,
-                updated_at = NOW()
-            WHERE id = $2
-            """,
-            status,
-            report_id,
-        )
-
-    await callback.answer(
-        f"Статус изменён: {status}"
-    )
-
-    fake_callback = callback
-
-    await admin_report_details(
-        fake_callback
-    )
-
-
-# ============================================================
-# ADMIN GIVE SUBSCRIPTION
-# ============================================================
-
-@dp.callback_query(F.data == "admin:subscription")
-async def admin_subscription(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    if not await admin_only(callback):
-        return
-
-    await state.clear()
-
-    await state.set_state(
-        SubscriptionForm.user_id
-    )
-
-    await callback.message.edit_text(
-        "<b>💎 Выдача подписки</b>\n\n"
-        "Отправьте Telegram ID пользователя."
-    )
-
-    await callback.answer()
-
-
-@dp.message(SubscriptionForm.user_id)
-async def subscription_user_id(
+@dp.message(AdminBroadcast.text)
+async def admin_broadcast_send(
     message: Message,
-    state: FSMContext,
+    state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
         return
 
-    value = (message.text or "").strip()
+    text = message.text
 
-    try:
-        user_id = int(value)
-    except ValueError:
-        await message.answer(
-            "⚠️ Telegram ID должен быть числом."
-        )
-        return
+    users = await db.fetch("""
+        SELECT telegram_id
+        FROM users
+    """)
 
-    user = await get_user(user_id)
+    sent = 0
+    failed = 0
 
-    if not user:
-        await message.answer(
-            "❌ Пользователь ещё не запускал бота."
-        )
-        await state.clear()
-        return
+    for row in users:
 
-    await state.update_data(
-        target_user_id=user_id
-    )
+        try:
+            await bot.send_message(
+                row["telegram_id"],
+                text
+            )
 
-    await state.set_state(
-        SubscriptionForm.days
-    )
+            sent += 1
 
-    await message.answer(
-        "<b>📅 Срок подписки</b>\n\n"
-        "Введите количество дней.\n\n"
-        "Например:\n"
-        "<code>7</code>\n"
-        "<code>30</code>\n"
-        "<code>365</code>"
-    )
+            await asyncio.sleep(0.05)
 
-
-@dp.message(SubscriptionForm.days)
-async def subscription_days(
-    message: Message,
-    state: FSMContext,
-):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    try:
-        days = int(
-            (message.text or "").strip()
-        )
-    except ValueError:
-        await message.answer(
-            "⚠️ Введите количество дней числом."
-        )
-        return
-
-    if days <= 0 or days > 3650:
-        await message.answer(
-            "⚠️ Срок должен быть от 1 до 3650 дней."
-        )
-        return
-
-    data = await state.get_data()
-
-    user_id = data["target_user_id"]
-
-    until = await give_subscription(
-        user_id,
-        days,
-    )
+        except Exception:
+            failed += 1
 
     await state.clear()
 
     await message.answer(
-        "<b>✅ Подписка выдана</b>\n\n"
-        f"👤 ID: <code>{user_id}</code>\n"
-        f"📅 Дней: <b>{days}</b>\n"
-        f"⏳ До: <b>{until.strftime('%d.%m.%Y %H:%M')}</b>",
-        reply_markup=admin_keyboard(),
+        "📢 <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}",
+        parse_mode="HTML",
+        reply_markup=admin_menu()
     )
-
-
-# ============================================================
-# ADMIN REMOVE SUBSCRIPTION
-# ============================================================
-
-@dp.callback_query(F.data == "admin:remove_sub")
-async def admin_remove_subscription(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    if not await admin_only(callback):
-        return
-
-    await state.set_state(
-        SubscriptionForm.user_id
-    )
-
-    await state.update_data(
-        remove_mode=True
-    )
-
-    await callback.message.edit_text(
-        "<b>❌ Снять подписку</b>\n\n"
-        "Отправьте Telegram ID пользователя."
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# SPECIAL USER ID HANDLER FOR REMOVE
-# ============================================================
-
-@dp.message(SubscriptionForm.user_id)
-async def subscription_user_handler(
-    message: Message,
-    state: FSMContext,
-):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    data = await state.get_data()
-
-    if not data.get("remove_mode"):
-        return
-
-    try:
-        user_id = int(
-            (message.text or "").strip()
-        )
-    except ValueError:
-        await message.answer(
-            "⚠️ Некорректный Telegram ID."
-        )
-        return
-
-    user = await get_user(user_id)
-
-    if not user:
-        await message.answer(
-            "❌ Пользователь не найден."
-        )
-        await state.clear()
-        return
-
-    await remove_subscription(user_id)
-
-    await state.clear()
-
-    await message.answer(
-        "<b>✅ Подписка снята</b>\n\n"
-        f"👤 Пользователь: <code>{user_id}</code>",
-        reply_markup=admin_keyboard(),
-    )
-
-
-# ============================================================
-# CANCEL / BACK
-# ============================================================
-
-@dp.callback_query(F.data == "cancel")
-async def cancel(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    await state.clear()
-
-    await callback.message.edit_text(
-        "<b>❌ Отменено</b>\n\n"
-        "Главное меню:",
-        reply_markup=main_keyboard(),
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "back:main")
-async def back_main(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    await state.clear()
-
-    await callback.message.edit_text(
-        "<b>🔥 FENIX REPORT</b>\n\n"
-        "Выберите действие:",
-        reply_markup=main_keyboard(),
-    )
-
-    await callback.answer()
 
 
 # ============================================================
@@ -1625,56 +1228,42 @@ async def back_main(
 
 @dp.message()
 async def fallback(message: Message):
-    await register_user(
-        message.from_user
-    )
 
-    if message.from_user.id == ADMIN_ID:
-        await message.answer(
-            "<b>👑 Вы администратор.</b>\n\n"
-            "Используйте /admin"
-        )
-        return
+    await upsert_user(message)
 
-    if not await has_subscription(
-        message.from_user.id
-    ):
+    if not await has_subscription(message.from_user.id):
         await message.answer(
-            "<b>⛔ Доступ закрыт</b>\n\n"
-            "Для использования Fenix Report "
-            "необходима активная подписка.\n\n"
-            "Обратитесь к администратору."
+            "🔐 Для доступа необходима активная подписка.",
+            reply_markup=subscription_menu()
         )
         return
 
     await message.answer(
-        "<b>🔥 FENIX REPORT</b>\n\n"
-        "Выберите действие:",
-        reply_markup=main_keyboard(),
+        "Используйте кнопки меню:",
+        reply_markup=main_menu()
     )
 
 
 # ============================================================
-# MAIN
+# STARTUP
 # ============================================================
 
 async def main():
-    logger.info("Starting Fenix...")
 
-    await init_database()
+    global db
 
-    me = await bot.get_me()
+    await init_db()
 
-    logger.info(
-        "Bot started: @%s",
-        me.username,
-    )
+    logger.info("Fenix Report starting...")
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if db:
+            await db.close()
+
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped")
+    asyncio.run(main())
